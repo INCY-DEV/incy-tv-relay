@@ -15,6 +15,8 @@ export const TTL_SECONDS = 300; // 5 минут, как в спецификац�
 export const MAX_CODE_ATTEMPTS = 5; // после 5 неудач код сгорает
 
 const key = (code) => `pair:${code}`;
+// Канал уведомлений: TV ждёт здесь, отправитель публикует при записи.
+const channel = (code) => `ch:${code}`;
 
 // Sender читает {sid, ya}. Это же считается попыткой подбора кода,
 // поэтому инкремент счётчика и проверка лимита — одна операция.
@@ -46,6 +48,9 @@ const LUA_PUT = `
   local ttl = redis.call('TTL', KEYS[1])
   if ttl < 0 then ttl = tonumber(ARGV[2]) end
   redis.call('SET', KEYS[1], cjson.encode(rec), 'EX', ttl)
+  -- Будим TV, который висит на long-poll. Он может ждать на другом поде,
+  -- поэтому именно pub/sub, а не событие в памяти процесса.
+  redis.call('PUBLISH', KEYS[2], '1')
   return 'ok'
 `;
 
@@ -108,8 +113,32 @@ export class Store {
   // 'ok' | 'exists' | 'notfound'
   async putPayload(code, payload) {
     return this.redis.eval(
-      LUA_PUT, 1, key(code), JSON.stringify(payload), TTL_SECONDS,
+      LUA_PUT, 2, key(code), channel(code), JSON.stringify(payload), TTL_SECONDS,
     );
+  }
+
+  // Ждём появления payload по подписке. Возвращает true, если пришло
+  // уведомление, false — если истёк таймаут или клиент отвалился.
+  //
+  // Подписка требует отдельного соединения: в режиме subscribe Redis не
+  // принимает обычные команды, а основной клиент нужен для чтения записи.
+  async waitForPayload(code, timeoutMs, signal) {
+    const sub = this.redis.duplicate();
+    try {
+      await sub.subscribe(channel(code));
+      return await new Promise((resolve) => {
+        const done = (v) => { clearTimeout(timer); resolve(v); };
+        const timer = setTimeout(() => done(false), timeoutMs);
+        sub.on('message', () => done(true));
+        // Клиент закрыл соединение — не держим подписку впустую.
+        signal?.addEventListener?.('abort', () => done(false), { once: true });
+      });
+    } catch {
+      // Подписка не удалась — вызывающий код сделает обычную проверку.
+      return false;
+    } finally {
+      sub.disconnect();
+    }
   }
 
   // {status: 'ok'|'empty'|'notfound', payload?}

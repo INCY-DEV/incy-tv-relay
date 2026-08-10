@@ -13,10 +13,11 @@ export const LIMITS = {
   bodyBytes: 64 * 1024,
 };
 
-// Long-poll: TV висит до 30 секунд, опрашивая Redis. Интервал 500 мс —
-// компромисс между задержкой доставки и нагрузкой на Redis.
+// Long-poll: TV висит до 30 секунд. Доставка идёт через pub/sub, а этот
+// интервал — только страховка от потерянного уведомления (publish в зазоре
+// между чтением и подпиской). Поэтому он большой: холостых обращений почти нет.
 const POLL_TIMEOUT_MS = 30_000;
-const POLL_INTERVAL_MS = 500;
+const FALLBACK_CHECK_MS = 5_000;
 
 export function buildApp(store, opts = {}) {
   const app = Fastify({
@@ -32,7 +33,7 @@ export function buildApp(store, opts = {}) {
   });
 
   const pollTimeout = opts.pollTimeoutMs ?? POLL_TIMEOUT_MS;
-  const pollInterval = opts.pollIntervalMs ?? POLL_INTERVAL_MS;
+  const fallbackCheckMs = opts.pollIntervalMs ?? FALLBACK_CHECK_MS;
 
   // Тело больше лимита — 413, как в спецификации (Fastify по умолчанию 400).
   app.setErrorHandler((err, req, reply) => {
@@ -135,9 +136,10 @@ export function buildApp(store, opts = {}) {
     if (!isValidCode(code)) return reply.code(404).send({ error: 'not_found' });
 
     const deadline = Date.now() + pollTimeout;
-    // Клиент мог отвалиться — прекращаем опрос, чтобы не жечь Redis впустую.
-    let aborted = false;
-    req.raw.on('close', () => { aborted = true; });
+    // Клиент мог отвалиться — прекращаем ожидание, чтобы не держать
+    // подписку и соединение к Redis впустую.
+    const ac = new AbortController();
+    req.raw.on('close', () => ac.abort());
 
     for (;;) {
       const res = await store.takePayload(code);
@@ -147,11 +149,21 @@ export function buildApp(store, opts = {}) {
       if (res.status === 'notfound') {
         return reply.code(404).send({ error: 'not_found' });
       }
-      if (aborted || Date.now() + pollInterval >= deadline) {
+
+      const left = deadline - Date.now();
+      if (ac.signal.aborted || left <= 0) {
         // Ничего не пришло за отведённое время — TV повторит запрос.
         return reply.code(204).send();
       }
-      await new Promise((r) => setTimeout(r, pollInterval));
+
+      // Ждём уведомления вместо опроса раз в 500 мс: при тысячах висящих
+      // клиентов опрос давал бы тысячи холостых обращений к Redis в секунду.
+      //
+      // Потолок ожидания нужен, даже когда событие не пришло: publish
+      // мог случиться в зазоре между takePayload и subscribe, а pub/sub
+      // не хранит пропущенные сообщения. Раз в несколько секунд
+      // перепроверяем запись — это ловит такую гонку.
+      await store.waitForPayload(code, Math.min(left, fallbackCheckMs), ac.signal);
     }
   });
 
