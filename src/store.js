@@ -117,28 +117,50 @@ export class Store {
     );
   }
 
-  // Ждём появления payload по подписке. Возвращает true, если пришло
-  // уведомление, false — если истёк таймаут или клиент отвалился.
+  // Подписка на уведомление о записи. Возвращает объект с методом wait():
+  // подписаться нужно ДО первой проверки записи, иначе publish, случившийся
+  // в зазоре между чтением и подпиской, будет потерян — pub/sub не хранит
+  // пропущенные сообщения.
   //
-  // Подписка требует отдельного соединения: в режиме subscribe Redis не
-  // принимает обычные команды, а основной клиент нужен для чтения записи.
-  async waitForPayload(code, timeoutMs, signal) {
+  // Отдельное соединение обязательно: в режиме subscribe Redis не принимает
+  // обычные команды, а основной клиент нужен для чтения записи.
+  async watch(code) {
     const sub = this.redis.duplicate();
+    let fired = false;
+    let notify = null;
+
+    sub.on('message', () => {
+      fired = true;
+      if (notify) { notify(); notify = null; }
+    });
+
     try {
       await sub.subscribe(channel(code));
-      return await new Promise((resolve) => {
-        const done = (v) => { clearTimeout(timer); resolve(v); };
-        const timer = setTimeout(() => done(false), timeoutMs);
-        sub.on('message', () => done(true));
-        // Клиент закрыл соединение — не держим подписку впустую.
-        signal?.addEventListener?.('abort', () => done(false), { once: true });
-      });
     } catch {
-      // Подписка не удалась — вызывающий код сделает обычную проверку.
-      return false;
-    } finally {
+      // Подписка не удалась — вызывающий код переживёт: он всё равно
+      // перепроверяет запись по таймауту.
       sub.disconnect();
+      return { wait: async (ms) => { await new Promise((r) => setTimeout(r, ms)); },
+               close: () => {} };
     }
+
+    return {
+      // Ждём событие не дольше ms. Если оно уже приходило — возвращаемся сразу.
+      async wait(ms, signal) {
+        if (fired) { fired = false; return true; }
+        return new Promise((resolve) => {
+          const done = (v) => {
+            clearTimeout(timer);
+            notify = null;
+            resolve(v);
+          };
+          const timer = setTimeout(() => done(false), ms);
+          notify = () => done(true);
+          signal?.addEventListener?.('abort', () => done(false), { once: true });
+        });
+      },
+      close() { sub.disconnect(); },
+    };
   }
 
   // {status: 'ok'|'empty'|'notfound', payload?}

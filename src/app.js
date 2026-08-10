@@ -141,29 +141,34 @@ export function buildApp(store, opts = {}) {
     const ac = new AbortController();
     req.raw.on('close', () => ac.abort());
 
-    for (;;) {
-      const res = await store.takePayload(code);
-      if (res.status === 'ok') {
-        return reply.code(200).send(res.payload);
-      }
-      if (res.status === 'notfound') {
-        return reply.code(404).send({ error: 'not_found' });
-      }
+    // Подписываемся ДО первой проверки: иначе publish, случившийся между
+    // чтением записи и подпиской, потерялся бы — pub/sub не хранит
+    // пропущенные сообщения. Одна подписка на весь запрос, а не на итерацию.
+    const watcher = await store.watch(code);
 
-      const left = deadline - Date.now();
-      if (ac.signal.aborted || left <= 0) {
-        // Ничего не пришло за отведённое время — TV повторит запрос.
-        return reply.code(204).send();
-      }
+    try {
+      for (;;) {
+        const res = await store.takePayload(code);
+        if (res.status === 'ok') {
+          return reply.code(200).send(res.payload);
+        }
+        if (res.status === 'notfound') {
+          return reply.code(404).send({ error: 'not_found' });
+        }
 
-      // Ждём уведомления вместо опроса раз в 500 мс: при тысячах висящих
-      // клиентов опрос давал бы тысячи холостых обращений к Redis в секунду.
-      //
-      // Потолок ожидания нужен, даже когда событие не пришло: publish
-      // мог случиться в зазоре между takePayload и subscribe, а pub/sub
-      // не хранит пропущенные сообщения. Раз в несколько секунд
-      // перепроверяем запись — это ловит такую гонку.
-      await store.waitForPayload(code, Math.min(left, fallbackCheckMs), ac.signal);
+        const left = deadline - Date.now();
+        if (ac.signal.aborted || left <= 0) {
+          // Ничего не пришло за отведённое время — TV повторит запрос.
+          return reply.code(204).send();
+        }
+
+        // Ждём уведомления вместо опроса раз в 500 мс: при тысячах висящих
+        // клиентов опрос давал бы тысячи холостых обращений к Redis в секунду.
+        // Потолок — страховка на случай, если событие всё же не дойдёт.
+        await watcher.wait(Math.min(left, fallbackCheckMs), ac.signal);
+      }
+    } finally {
+      watcher.close();
     }
   });
 
