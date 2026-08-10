@@ -1,0 +1,232 @@
+# INCY TV Relay — всё в одном namespace.
+#
+# Данные эфемерные (TTL 5 минут), поэтому Redis без диска: при рестарте
+# теряются незавершённые пейринги, пользователь просто повторит — это
+# дешевле, чем PVC и его обслуживание.
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: incy-tv-relay
+
+---
+# ── Redis ────────────────────────────────────────────────────────────────
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: redis-config
+  namespace: incy-tv-relay
+data:
+  redis.conf: |
+    # Диска нет намеренно: всё живёт максимум 5 минут.
+    save ""
+    appendonly no
+
+    # Записи и так с TTL, но лимит нужен как страховка от всплеска:
+    # без него под съест память ноды.
+    maxmemory 192mb
+    maxmemory-policy volatile-ttl
+
+    # Пейринг-сессии короткие; долгие простаивающие соединения не нужны.
+    timeout 300
+    tcp-keepalive 60
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis
+  namespace: incy-tv-relay
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels: { app: redis }
+  template:
+    metadata:
+      labels: { app: redis }
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 999
+        fsGroup: 999
+      containers:
+        - name: redis
+          image: redis:7-alpine
+          command: ["redis-server", "/etc/redis/redis.conf"]
+          ports:
+            - containerPort: 6379
+              name: redis
+          volumeMounts:
+            - name: config
+              mountPath: /etc/redis
+          resources:
+            requests: { cpu: 50m, memory: 64Mi }
+            limits: { memory: 256Mi }
+          livenessProbe:
+            tcpSocket: { port: 6379 }
+            initialDelaySeconds: 10
+            periodSeconds: 20
+          readinessProbe:
+            exec:
+              command: ["redis-cli", "ping"]
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+      volumes:
+        - name: config
+          configMap: { name: redis-config }
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis
+  namespace: incy-tv-relay
+spec:
+  selector: { app: redis }
+  ports:
+    - port: 6379
+      targetPort: 6379
+
+---
+# ── Релей ────────────────────────────────────────────────────────────────
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: relay
+  namespace: incy-tv-relay
+spec:
+  replicas: 2
+  selector:
+    matchLabels: { app: relay }
+  template:
+    metadata:
+      labels: { app: relay }
+    spec:
+      # Реплики на разных нодах: падение одной ноды не должно
+      # уносить весь релей.
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels: { app: relay }
+                topologyKey: kubernetes.io/hostname
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+      containers:
+        - name: relay
+          image: ghcr.io/justyay/incy-tv-relay:1.0.0
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8080
+              name: http
+          env:
+            - name: REDIS_URL
+              value: redis://redis.incy-tv-relay.svc.cluster.local:6379
+            - name: PORT
+              value: "8080"
+            - name: LOG_LEVEL
+              value: info
+          resources:
+            requests: { cpu: 50m, memory: 96Mi }
+            limits: { memory: 256Mi }
+          livenessProbe:
+            httpGet: { path: /healthz, port: 8080 }
+            initialDelaySeconds: 5
+            periodSeconds: 20
+          readinessProbe:
+            # readyz проверяет и Redis: под без Redis бесполезен,
+            # пусть его выведут из балансировки.
+            httpGet: { path: /readyz, port: 8080 }
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: relay
+  namespace: incy-tv-relay
+spec:
+  selector: { app: relay }
+  ports:
+    - port: 80
+      targetPort: 8080
+      name: http
+
+---
+# ── Ingress ──────────────────────────────────────────────────────────────
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: relay
+  namespace: incy-tv-relay
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    # Long-poll висит до 30 секунд — таймауты должны это переживать.
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "60"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "60"
+    # Тело ограничено спецификацией; nginx режет раньше приложения.
+    nginx.ingress.kubernetes.io/proxy-body-size: "64k"
+    # Второй рубеж лимитов: приложение считает по коду, nginx — по IP.
+    nginx.ingress.kubernetes.io/limit-rpm: "60"
+    nginx.ingress.kubernetes.io/limit-connections: "20"
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts: [check.incytv.com]
+      secretName: relay-tls
+  rules:
+    - host: check.incytv.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: relay
+                port:
+                  number: 80
+
+---
+# Бюджет доступности: при обслуживании нод хотя бы одна реплика жива.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: relay
+  namespace: incy-tv-relay
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels: { app: relay }
+
+---
+# Redis доступен только релею — снаружи namespace к нему ходить незачем.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: redis-from-relay-only
+  namespace: incy-tv-relay
+spec:
+  podSelector:
+    matchLabels: { app: redis }
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels: { app: relay }
+      ports:
+        - port: 6379
