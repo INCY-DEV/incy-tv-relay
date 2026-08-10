@@ -106,11 +106,10 @@ export function buildApp(store, opts = {}) {
     if (!decodeB64url(body.yb, SIZES.point)) {
       return reply.code(400).send({ error: 'bad_yb' });
     }
-    if (!decodeB64url(body.nonce, SIZES.nonce)) {
-      return reply.code(400).send({ error: 'bad_nonce' });
-    }
-    // Содержимое ct релей не проверяет и проверить не может —
-    // только границы размера.
+    // Отдельного поля nonce нет: первые 12 байт ct — это он. Клиенты шлют
+    // `combined` из CryptoKit / libsodium одним куском, и релею незачем его
+    // разбирать — содержимое он всё равно не проверяет и проверить не может.
+    // Границы размера в checkCiphertext уже учитывают nonce.
     if (!checkCiphertext(body.ct)) {
       const tooBig = typeof body.ct === 'string'
         && body.ct.length > Math.ceil((MAX_CT_BYTES * 4) / 3) + 4;
@@ -120,7 +119,7 @@ export function buildApp(store, opts = {}) {
     }
 
     const res = await store.putPayload(code, {
-      yb: body.yb, nonce: body.nonce, ct: body.ct,
+      yb: body.yb, ct: body.ct,
     });
     if (res === 'notfound') return reply.code(404).send({ error: 'not_found' });
     if (res === 'exists') return reply.code(409).send({ error: 'already_sent' });

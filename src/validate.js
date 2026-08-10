@@ -40,13 +40,17 @@ export function decodeB64url(value, expectedBytes) {
 export const SIZES = {
   sid: 16, // session id от TV
   point: 32, // Ristretto255-точка (Ya / Yb)
-  nonce: 12, // ChaCha20-Poly1305
 };
 
-// Шифротекст: полезная нагрузка + 16 байт тега Poly1305.
-// Верхняя граница — из спецификации (64 KiB).
+// Шифротекст: 12 байт nonce + полезная нагрузка + 16 байт тега Poly1305.
+//
+// Nonce приходит НЕ отдельным полем, а первыми 12 байтами ct — это раскладка
+// `combined` у CryptoKit (nonce ‖ ciphertext ‖ tag), которую напрямую понимает
+// libsodium на Android. Отдельное поле заставило бы обе стороны разбирать и
+// снова собирать этот буфер ради релея, который в него всё равно не смотрит.
 export const MAX_CT_BYTES = 64 * 1024;
-export const MIN_CT_BYTES = 17; // хотя бы 1 байт данных + тег
+export const NONCE_BYTES = 12;
+export const MIN_CT_BYTES = NONCE_BYTES + 1 + 16; // nonce + хотя бы 1 байт данных + тег
 
 export function checkCiphertext(value) {
   if (typeof value !== 'string' || !B64URL_RE.test(value)) return null;

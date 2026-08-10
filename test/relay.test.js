@@ -50,16 +50,16 @@ describe('полный сценарий пейринга', () => {
     assert.deepEqual(r2.json(), { sid, ya }, 'Sender получил ровно то, что положил TV');
 
     // Sender шлёт зашифрованный payload.
-    const yb = b64(32); const nonce = b64(12); const ct = b64(200);
+    const yb = b64(32); const ct = b64(200);
     const r3 = await app.inject({
-      method: 'POST', url: `/pair/${code}/send`, payload: { yb, nonce, ct },
+      method: 'POST', url: `/pair/${code}/send`, payload: { yb, ct },
     });
     assert.equal(r3.statusCode, 204);
 
     // TV забирает.
     const r4 = await app.inject({ method: 'GET', url: `/pair/${code}/result` });
     assert.equal(r4.statusCode, 200);
-    assert.deepEqual(r4.json(), { yb, nonce, ct }, 'блоб дошёл байт в байт');
+    assert.deepEqual(r4.json(), { yb, ct }, 'блоб дошёл байт в байт');
 
     // Повторно забрать нельзя — запись удалена.
     const r5 = await app.inject({ method: 'GET', url: `/pair/${code}/result` });
@@ -75,7 +75,7 @@ describe('полный сценарий пейринга', () => {
       setTimeout(async () => {
         resolve(await app.inject({
           method: 'POST', url: `/pair/${code}/send`,
-          payload: { yb: b64(32), nonce: b64(12), ct: b64(120) },
+          payload: { yb: b64(32), ct: b64(120) },
         }));
       }, 300);
     });
@@ -131,7 +131,7 @@ describe('одноразовость и занятость', () => {
   test('повторная отправка payload → 409', async () => {
     const code = makeCode();
     await init(code);
-    const p = { yb: b64(32), nonce: b64(12), ct: b64(100) };
+    const p = { yb: b64(32), ct: b64(100) };
     assert.equal((await app.inject({
       method: 'POST', url: `/pair/${code}/send`, payload: p,
     })).statusCode, 204);
@@ -143,7 +143,7 @@ describe('одноразовость и занятость', () => {
   test('send на несуществующий код → 404', async () => {
     const r = await app.inject({
       method: 'POST', url: `/pair/${makeCode()}/send`,
-      payload: { yb: b64(32), nonce: b64(12), ct: b64(50) },
+      payload: { yb: b64(32), ct: b64(50) },
     });
     assert.equal(r.statusCode, 404);
   });
@@ -164,13 +164,13 @@ describe('валидация входных данных', () => {
     assert.equal((await init(code, b64(16), 'не-base64!!')).statusCode, 400, 'не base64url');
   });
 
-  test('nonce и yb неверной длины отвергаются', async () => {
+  test('yb и ct неверной длины отвергаются', async () => {
     const code = makeCode();
     await init(code);
     const bad = [
-      { yb: b64(31), nonce: b64(12), ct: b64(50) },
-      { yb: b64(32), nonce: b64(11), ct: b64(50) },
-      { yb: b64(32), nonce: b64(12), ct: 'x' }, // ct короче тега
+      { yb: b64(31), ct: b64(50) },
+      { yb: b64(32), ct: 'x' }, // ct короче nonce + тега
+      { yb: b64(32), ct: b64(28) }, // nonce + тег, но нулевая полезная нагрузка
     ];
     for (const p of bad) {
       const r = await app.inject({ method: 'POST', url: `/pair/${code}/send`, payload: p });
@@ -183,7 +183,7 @@ describe('валидация входных данных', () => {
     await init(code);
     const r = await app.inject({
       method: 'POST', url: `/pair/${code}/send`,
-      payload: { yb: b64(32), nonce: b64(12), ct: b64(70 * 1024) },
+      payload: { yb: b64(32), ct: b64(70 * 1024) },
     });
     assert.equal(r.statusCode, 413);
   });
