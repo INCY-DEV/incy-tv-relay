@@ -19,6 +19,17 @@ export const LIMITS = {
 const POLL_TIMEOUT_MS = 30_000;
 const FALLBACK_CHECK_MS = 5_000;
 
+// Признаки того, что упал не запрос, а хранилище. ioredis не даёт одного
+// кода на все случаи, поэтому смотрим и на код, и на текст.
+function isUnavailable(err) {
+  const code = err?.code ?? '';
+  if (['ECONNREFUSED', 'ECONNRESET', 'ETIMEDOUT', 'EPIPE', 'ENOTFOUND'].includes(code)) {
+    return true;
+  }
+  const msg = String(err?.message ?? '');
+  return /connection is closed|stream isn't writeable|max retries|connect/i.test(msg);
+}
+
 export function buildApp(store, opts = {}) {
   const app = Fastify({
     // Тела не логируем: там шифротекст, но логи имеют свойство утекать.
@@ -42,6 +53,13 @@ export function buildApp(store, opts = {}) {
     }
     if (err.statusCode === 400 || err.code === 'FST_ERR_CTP_INVALID_MEDIA_TYPE') {
       return reply.code(400).send({ error: 'bad_request' });
+    }
+    // Redis недоступен — это временно, и клиенту стоит повторить.
+    // 500 он бы показал пользователю как «ошибка», 503 с Retry-After
+    // читается однозначно.
+    if (isUnavailable(err)) {
+      req.log.error({ err: err.message }, 'storage unavailable');
+      return reply.code(503).header('Retry-After', '2').send({ error: 'unavailable' });
     }
     // Внутреннюю ошибку наружу не раскрываем: пишем в лог, отдаём код.
     req.log.error({ err: err.message }, 'request failed');
