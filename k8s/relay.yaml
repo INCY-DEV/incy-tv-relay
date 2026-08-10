@@ -118,12 +118,14 @@ spec:
                 labelSelector:
                   matchLabels: { app: relay }
                 topologyKey: kubernetes.io/hostname
+      imagePullSecrets:
+        - name: ghcr
       securityContext:
         runAsNonRoot: true
         runAsUser: 1000
       containers:
         - name: relay
-          image: ghcr.io/justyay/incy-tv-relay:1.0.0
+          image: ghcr.io/incy-dev/incy-tv-relay:main
           imagePullPolicy: IfNotPresent
           ports:
             - containerPort: 8080
