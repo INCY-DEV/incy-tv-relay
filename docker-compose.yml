@@ -1,0 +1,26 @@
+# Запуск релея одной командой: docker compose up -d
+#
+# Данные эфемерные (TTL 5 минут), поэтому Redis без диска —
+# при рестарте теряются только незавершённые пейринги.
+services:
+  redis:
+    image: redis:7-alpine
+    command: >
+      redis-server
+      --save ""
+      --appendonly no
+      --maxmemory 192mb
+      --maxmemory-policy volatile-ttl
+    restart: unless-stopped
+
+  relay:
+    build: .
+    image: ghcr.io/incy-dev/incy-tv-relay:main
+    environment:
+      REDIS_URL: redis://redis:6379
+      PORT: "8080"
+    ports:
+      - "8080:8080"
+    depends_on:
+      - redis
+    restart: unless-stopped
