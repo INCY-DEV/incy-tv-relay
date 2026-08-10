@@ -6,8 +6,10 @@ import { TTL_SECONDS } from './store.js';
 // именно он делает перебор бесполезным, потому что переход на другой IP
 // от него не спасает.
 export const LIMITS = {
-  perIpPerMinute: 30,
-  initPerIpPerHour: 10,
+  // 300/мин: за одним адресом CGNAT могут быть сотни устройств, а телевизор
+  // на long-poll делает ~2 запроса в минуту. Защиту от перебора это не
+  // ослабляет — она держится на лимите попыток по коду, а не по IP.
+  perIpPerMinute: 300,
   bodyBytes: 64 * 1024,
 };
 
@@ -59,12 +61,13 @@ export function buildApp(store, opts = {}) {
   });
 
   // ── TV занимает код ────────────────────────────────────────────────────
+  // Отдельного лимита на init нет намеренно. Он защищал бы только от
+  // заполнения Redis, а для этого нужны тысячи запросов в секунду — их
+  // и так режет общий лимит на IP, плюс volatile-ttl вытесняет старые
+  // записи. Зато почасовой лимит ломал реальные сценарии: за CGNAT
+  // оператора или в общежитии за одним адресом сотни телевизоров, и
+  // одиннадцатый пользователь не смог бы добавить подписку.
   app.post('/pair/init', async (req, reply) => {
-    const okInit = await store
-      .hitRateLimit(`init:${clientIp(req)}`, LIMITS.initPerIpPerHour, 3600)
-      .catch(() => true);
-    if (!okInit) return reply.code(429).send({ error: 'rate_limited' });
-
     const body = req.body ?? {};
     if (!isValidCode(body.code)) {
       return reply.code(400).send({ error: 'bad_code' });
