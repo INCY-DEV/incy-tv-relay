@@ -1,6 +1,7 @@
 import { test, describe, before, after, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { randomBytes } from 'node:crypto';
+import { once } from 'node:events';
 import { buildApp } from '../src/app.js';
 import { Store, MAX_CODE_ATTEMPTS } from '../src/store.js';
 import { CODE_ALPHABET } from '../src/validate.js';
@@ -18,6 +19,7 @@ let store; let app;
 before(async () => {
   process.env.REDIS_URL = REDIS_URL;
   store = Store.fromEnv();
+  if (store.redis.status !== 'ready') await once(store.redis, 'ready');
   // Быстрый long-poll, чтобы тесты не ждали 30 секунд.
   app = buildApp(store, { logger: false, pollTimeoutMs: 1500, pollIntervalMs: 100 });
   await app.ready();
