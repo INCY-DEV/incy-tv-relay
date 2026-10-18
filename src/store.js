@@ -1,4 +1,5 @@
 import Redis from 'ioredis';
+import { within } from './deadline.js';
 
 // Хранилище пейринг-сессий.
 //
@@ -76,18 +77,38 @@ const LUA_RATELIMIT = `
 export class Store {
   constructor(redis) {
     this.redis = redis;
+    // Avoid unhandled ioredis events; do not log URLs, keys or payloads.
+    let lastError = 0;
+    this.onRedisError = (err) => {
+      if (Date.now() - lastError < 5000) return;
+      lastError = Date.now();
+      console.error(JSON.stringify({ level: 'error', msg: 'redis connection error',
+        code: err?.code || 'REDIS_ERROR' }));
+    };
+    redis.on('error', this.onRedisError);
   }
 
   static fromEnv(env = process.env) {
-    const redis = new Redis(env.REDIS_URL || 'redis://127.0.0.1:6379', {
-      // Пейринг живёт 5 минут — долго копить запросы смысла нет,
-      // но очередь нужна: без неё команды, посланные до установки
-      // соединения (старт пода, рестарт Redis), падают с ошибкой
-      // вместо того, чтобы дождаться подключения.
-      maxRetriesPerRequest: 2,
-      connectTimeout: 3000,
-      enableOfflineQueue: true,
-    });
+    const options = {
+      maxRetriesPerRequest: 1,
+      connectTimeout: 1500,
+      commandTimeout: 1500,
+      // Do not queue disconnected requests for execution after their response.
+      enableOfflineQueue: false,
+      autoResendUnfulfilledCommands: false,
+      retryStrategy: (attempt) => Math.min(attempt * 100, 1000),
+      sentinelRetryStrategy: (attempt) => Math.min(attempt * 100, 1000),
+      // Re-discover the master after promotion; do not replay the write.
+      reconnectOnError: (err) => err.message.startsWith('READONLY'),
+    };
+    const sentinels = env.REDIS_SENTINELS ? JSON.parse(env.REDIS_SENTINELS) : null;
+    if (sentinels && (!Array.isArray(sentinels) || sentinels.length < 1 ||
+      sentinels.some((s) => !s.host || !Number.isInteger(s.port) || s.port < 1 || s.port > 65535))) {
+      throw new Error('REDIS_SENTINELS must be a non-empty array of {host, port}');
+    }
+    const redis = sentinels
+      ? new Redis({ ...options, sentinels, failoverDetector: true, name: env.REDIS_MASTER_NAME || 'tv-relay' })
+      : new Redis(env.REDIS_URL || 'redis://127.0.0.1:6379', options);
     return new Store(redis);
   }
 
@@ -125,7 +146,8 @@ export class Store {
   // Отдельное соединение обязательно: в режиме subscribe Redis не принимает
   // обычные команды, а основной клиент нужен для чтения записи.
   async watch(code) {
-    const sub = this.redis.duplicate();
+    const sub = this.redis.duplicate({ lazyConnect: true, failoverDetector: false });
+    sub.on('error', this.onRedisError);
     let fired = false;
     let notify = null;
 
@@ -135,6 +157,7 @@ export class Store {
     });
 
     try {
+      await within(sub.connect(), 1500);
       await sub.subscribe(channel(code));
     } catch {
       // Подписка не удалась — вызывающий код переживёт: он всё равно
@@ -180,10 +203,21 @@ export class Store {
   }
 
   async ping() {
+    if (this.redis.status !== 'ready') {
+      const error = new Error('redis connection is closed');
+      error.code = 'ECONNRESET';
+      throw error;
+    }
     return this.redis.ping();
   }
 
   async close() {
-    await this.redis.quit().catch(() => {});
+    try {
+      if (this.redis.status === 'ready') await within(this.redis.quit(), 1500);
+    } catch {
+      // Disconnect still runs if the socket closes while QUIT is in flight.
+    } finally {
+      this.redis.disconnect();
+    }
   }
 }

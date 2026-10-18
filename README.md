@@ -61,3 +61,29 @@ docker compose up -d
 Ключ шифрования выводится на устройствах из 8-значного кода по протоколу
 CPace. Сервер видит только публичные значения `ya` и `yb`, из которых секрет
 не восстанавливается.
+
+## Redis availability
+
+Production can discover the writable primary through Redis Sentinel:
+
+```sh
+REDIS_SENTINELS='[{"host":"redis-ha-0.redis-ha.incy-tv-relay.svc.cluster.local","port":26379},{"host":"redis-ha-1.redis-ha.incy-tv-relay.svc.cluster.local","port":26379},{"host":"redis-ha-2.redis-ha.incy-tv-relay.svc.cluster.local","port":26379}]'
+REDIS_MASTER_NAME=tv-relay
+```
+
+Without `REDIS_SENTINELS`, `REDIS_URL` remains supported for local development.
+Sentinel notifications reconnect the command client after promotion. Disconnected
+commands are rejected instead of queued, and unacknowledged commands are not
+replayed automatically. An already-sent write may still have executed when its
+response is lost; clients must continue to handle occupied/consumed pairing codes.
+
+Redis commands and connection setup have a 1.5-second deadline. `/readyz` has a
+750-ms deadline and returns 503 with `Retry-After: 2` when storage is unavailable;
+`/healthz` remains independent of Redis. A failover can briefly return 503, and
+Redis asynchronous replication cannot guarantee preservation of every last write.
+
+Run `npm test` against a disposable Redis using `TEST_REDIS_URL` (the pairing
+suite clears that database). `node test/sentinel.integration.js` starts and cleans
+up its own local three-node Redis/Sentinel cluster, promotes another primary,
+and verifies that an existing pairing survives and accepts a new payload.
+It requires `redis-server` on PATH and does not use production configuration.

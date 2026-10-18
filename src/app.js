@@ -1,6 +1,7 @@
 import Fastify from 'fastify';
 import { isValidCode, decodeB64url, checkCiphertext, SIZES, MAX_CT_BYTES } from './validate.js';
 import { TTL_SECONDS } from './store.js';
+import { within } from './deadline.js';
 
 // Лимиты из спецификации. Лимит на код (в store.js) важнее лимита на IP:
 // именно он делает перебор бесполезным, потому что переход на другой IP
@@ -27,7 +28,7 @@ function isUnavailable(err) {
     return true;
   }
   const msg = String(err?.message ?? '');
-  return /connection is closed|stream isn't writeable|max retries|connect/i.test(msg);
+  return /connection is closed|stream isn't writeable|max retries|connect|command timed out|READONLY|NOREPLICAS|MASTERDOWN|LOADING|sentinel/i.test(msg);
 }
 
 export function buildApp(store, opts = {}) {
@@ -195,10 +196,10 @@ export function buildApp(store, opts = {}) {
 
   app.get('/readyz', async (req, reply) => {
     try {
-      await store.ping();
+      await within(store.ping(), opts.readinessTimeoutMs ?? 750);
       return { ok: true, ttl: TTL_SECONDS };
     } catch {
-      return reply.code(503).send({ ok: false, error: 'redis_unavailable' });
+      return reply.code(503).header('Retry-After', '2').send({ ok: false, error: 'redis_unavailable' });
     }
   });
 
